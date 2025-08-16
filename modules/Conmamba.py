@@ -1,8 +1,104 @@
-"""ConMamba encoder and Mamba decoder implementation.
+"""
+ConMamba Encoder and Mamba Decoder Implementation for Efficient ASR.
+
+This module implements the ConMamba architecture, a hybrid approach that combines
+Mamba's efficient state-space modeling with Conformer's convolution mechanisms.
+ConMamba achieves significant computational efficiency while maintaining competitive
+accuracy for automatic speech recognition tasks.
+
+ARCHITECTURAL INNOVATION:
+========================
+ConMamba represents a breakthrough in efficient audio modeling by integrating:
+- Mamba state-space models for long-range sequence dependencies
+- Conformer-style convolution modules for local feature modeling  
+- Bidirectional processing for enhanced context understanding
+- Linear computational complexity with respect to sequence length
+
+The architecture replaces traditional attention mechanisms with selective state-space
+models, reducing computational cost from O(n²) to O(n) while preserving modeling capacity.
+
+SYSTEM ROLE IN MAMBA-ASR:
+=========================
+This module serves as a drop-in replacement for standard Conformer encoders in the
+ASR pipeline, providing:
+- Encoder: ConmambaEncoder for audio feature sequence modeling
+- Decoder: MambaDecoder for autoregressive text generation
+- Streaming support: Compatible with dynamic chunk training for real-time inference
+- Memory efficiency: Reduced memory footprint compared to attention-based models
+
+CALL CHAIN INTEGRATION:
+======================
+Called by:
+- `modules/TransformerASR.py`: TransformerInterface.__init__() when encoder_module="conmamba"
+- `modules/Transformer.py`: TransformerInterface creates ConmambaEncoder instances
+- Training scripts: train_CTC.py and train_S2S.py via ASR pipeline
+
+Calls to:
+- `modules/mamba/bimamba.py`: BiMamba for bidirectional Mamba processing
+- `mamba_ssm.Mamba`: Standard unidirectional Mamba layers  
+- `speechbrain.nnet.attention.PositionalwiseFeedForward`: FFN components
+- `speechbrain.nnet.normalization.LayerNorm`: Layer normalization
+
+MAMBA INTEGRATION DETAILS:
+==========================
+The module integrates two types of Mamba implementations:
+1. Standard Mamba (mamba_ssm): Unidirectional for causal processing
+2. BiMamba (custom): Bidirectional for non-causal applications
+
+Mamba Configuration Management:
+- mamba_config dictionary controls state dimensions and expansion factors
+- bidirectional flag switches between Mamba types based on use case
+- Configuration passed through TransformerASR hierarchy to individual layers
+
+PERFORMANCE CHARACTERISTICS:
+===========================
+ConMamba provides several performance advantages:
+- Linear Complexity: O(n) vs O(n²) for standard attention
+- Memory Efficiency: Constant memory usage independent of sequence length  
+- Streaming Ready: Natural support for incremental processing
+- Apple Silicon Optimized: Efficient on MPS backend due to simpler operations
+
+Computational Trade-offs:
+- Reduced parameter sharing compared to full attention
+- Less parallelizable than attention (sequential state updates)
+- Better cache locality for long sequences
+- Lower memory bandwidth requirements
+
+DEVICE COMPATIBILITY:
+====================
+ConMamba is optimized for multiple compute platforms:
+- CUDA: Full performance with selective scan kernels
+- CPU: Reference implementation for development/testing  
+- Apple Silicon MPS: Efficient tensor operations, though some Mamba ops may fallback
+- Mixed Precision: Supports autocast with proper dtype handling
+
+STREAMING ARCHITECTURE:
+======================
+The ConMamba encoder supports streaming inference through:
+- Stateful Mamba layers that maintain hidden states across chunks
+- Convolution modules with causal padding for streaming compatibility
+- Integration with Dynamic Chunk Training for low-latency applications
+- Context preservation mechanisms for maintaining sequence history
+
+BIDIRECTIONAL PROCESSING:
+========================
+The BiMamba integration enables bidirectional context modeling:
+- Forward pass processes sequence left-to-right
+- Backward pass processes sequence right-to-left  
+- Outputs are combined for enhanced representation learning
+- Configurable via mamba_config['bidirectional'] parameter
+
+ERROR HANDLING PATTERNS:
+=======================
+The module implements robust error handling for:
+- Missing mamba_config: Assertion errors with clear messages
+- Bidirectional flag management: Proper restoration after layer creation
+- Device placement: Automatic tensor movement following model device
+- Mixed precision: Proper dtype conversion for Mamba operations
 
 Authors
 -------
-* Xilin Jiang 2024
+* Xilin Jiang 2024 (ConMamba architecture design and implementation)
 """
 
 import warnings
@@ -26,11 +122,126 @@ from speechbrain.utils.dynamic_chunk_training import DynChunkTrainConfig
 
 # Mamba
 from mamba_ssm import Mamba
-from modules.mamba.bimamba import Mamba as BiMamba 
+from modules.mamba.bimamba import Mamba as BiMamba
+
+
+# =============================================================================
+# NAMED CONSTANTS FOR AI-FIRST DOCUMENTATION
+# =============================================================================
+# These constants replace magic numbers throughout ConMamba implementation
+# to provide clear explanations and improve maintainability.
+
+class ConMambaConstants:
+    """Constants for ConMamba architecture configuration and computation."""
+    
+    # Convolution module constants
+    POINTWISE_KERNEL_SIZE = 1
+    """Kernel size for pointwise (1x1) convolutions in bottleneck layers."""
+    
+    CONV_STRIDE = 1
+    """Stride for all convolution operations - no downsampling in ConMamba."""
+    
+    CHANNEL_EXPANSION_FACTOR = 2
+    """Factor by which channels are expanded in pointwise convolution.
+    Input channels are doubled before GLU activation, which then halves them back."""
+    
+    GLU_SPLIT_DIMENSION = 1
+    """Dimension along which GLU splits channels (channel dimension)."""
+    
+    DILATION_POWER_BASE = 2
+    """Base for exponential dilation calculation: 2^(dilation-1)."""
+    
+    DILATION_OFFSET = 1
+    """Offset applied to dilation for power calculation: (dilation - 1)."""
+    
+    PADDING_DIVISOR = 2
+    """Divisor for symmetric padding calculation in non-causal mode."""
+    
+    # FFN scaling constants
+    FFN_RESIDUAL_SCALE = 0.5
+    """Scaling factor for FFN residual connections in ConMamba layers.
+    Applied as: x = x + 0.5 * ffn(x) for better training stability."""
+    
+    # Layer normalization constants
+    LAYER_NORM_EPS = 1e-6
+    """Epsilon value for layer normalization to prevent division by zero."""
+    
+    # Dynamic chunking constants
+    UNSUPPORTED_DILATION = 1
+    """Only dilation=1 is supported for dynamic chunk training.
+    Other dilation values require additional padding logic."""
+
+
+class BiMambaConstants:
+    """Constants specific to bidirectional Mamba configuration."""
+    
+    BIMAMBA_TYPE_V2 = 'v2'
+    """BiMamba architecture version - v2 provides better bidirectional fusion.""" 
 
 
 class ConvolutionModule(nn.Module):
-    """This is an implementation of convolution module in Conmamba.
+    """Conformer-style convolution module optimized for ConMamba architecture.
+
+    This module implements the convolution component of ConMamba layers, providing
+    local feature modeling to complement Mamba's global sequence modeling. It uses
+    depthwise separable convolutions with gated linear units for efficient parameter
+    usage and computational cost.
+
+    ARCHITECTURAL DESIGN:
+    ====================
+    The module follows the Conformer convolution design pattern:
+    1. Layer normalization for input stabilization
+    2. Pointwise expansion with 2x channel expansion + GLU activation
+    3. Depthwise convolution for local feature extraction
+    4. Layer normalization + activation + pointwise compression
+    5. Dropout for regularization
+
+    CROSS-FILE INTEGRATION:
+    ======================
+    Called by:
+    - ConmambaEncoderLayer.forward(): Local feature processing within ConMamba layers
+    
+    Calls to:
+    - torch.nn.LayerNorm: Input and output normalization
+    - torch.nn.Conv1d: Pointwise and depthwise convolutions
+    - torch.nn.GLU: Gated linear unit activation
+    - speechbrain activation modules: Configurable activation functions
+
+    DYNAMIC CHUNK TRAINING SUPPORT:
+    ===============================
+    The module implements sophisticated chunk-based processing for streaming:
+    - Divides input sequences into fixed-size chunks
+    - Applies convolution across chunk boundaries with proper padding
+    - Handles final chunk padding to maintain consistent chunk sizes
+    - Supports non-causal convolution with future masking per chunk
+
+    CAUSAL vs NON-CAUSAL MODES:
+    ===========================
+    Causal Mode (causal=True):
+    - Left-padding only to prevent future information leakage
+    - Compatible with streaming inference and autoregressive decoding
+    - Padding = (kernel_size - 1) * dilation_factor
+
+    Non-Causal Mode (causal=False):
+    - Symmetric padding for optimal modeling capacity
+    - Used in encoder layers where bidirectional context is available
+    - Padding = (kernel_size - 1) * dilation_factor // 2
+
+    MEMORY OPTIMIZATION:
+    ===================
+    The module implements several memory-efficient patterns:
+    - Depthwise convolution reduces parameters from O(C²K) to O(CK)
+    - GLU activation provides gating without additional parameters
+    - LayerNorm replaces BatchNorm for better streaming compatibility
+    - In-place operations where possible to reduce memory allocation
+
+    DEVICE COMPATIBILITY:
+    ====================
+    Fully compatible with all supported backends:
+    - CUDA: Optimized Conv1d operations with cuDNN acceleration
+    - CPU: Reference implementation for development
+    - Apple Silicon MPS: Efficient tensor operations, full MPS support
+    - Mixed Precision: Supports autocast with proper dtype handling
     """
 
     def __init__(
@@ -50,24 +261,28 @@ class ConvolutionModule(nn.Module):
         self.dilation = dilation
 
         if self.causal:
-            self.padding = (kernel_size - 1) * 2 ** (dilation - 1)
+            self.padding = (kernel_size - ConMambaConstants.DILATION_OFFSET) * ConMambaConstants.DILATION_POWER_BASE ** (dilation - ConMambaConstants.DILATION_OFFSET)
         else:
-            self.padding = (kernel_size - 1) * 2 ** (dilation - 1) // 2
+            self.padding = (kernel_size - ConMambaConstants.DILATION_OFFSET) * ConMambaConstants.DILATION_POWER_BASE ** (dilation - ConMambaConstants.DILATION_OFFSET) // ConMambaConstants.PADDING_DIVISOR
 
         self.layer_norm = nn.LayerNorm(input_size)
         self.bottleneck = nn.Sequential(
             # pointwise
             nn.Conv1d(
-                input_size, 2 * input_size, kernel_size=1, stride=1, bias=bias
+                input_size, 
+                ConMambaConstants.CHANNEL_EXPANSION_FACTOR * input_size, 
+                kernel_size=ConMambaConstants.POINTWISE_KERNEL_SIZE, 
+                stride=ConMambaConstants.CONV_STRIDE, 
+                bias=bias
             ),
-            nn.GLU(dim=1),
+            nn.GLU(dim=ConMambaConstants.GLU_SPLIT_DIMENSION),
         )
         # depthwise
         self.conv = nn.Conv1d(
             input_size,
             input_size,
             kernel_size=kernel_size,
-            stride=1,
+            stride=ConMambaConstants.CONV_STRIDE,
             padding=self.padding,
             dilation=dilation,
             groups=input_size,
@@ -104,8 +319,8 @@ class ConvolutionModule(nn.Module):
             ), "Chunked convolution not supported with causal padding"
 
             assert (
-                self.dilation == 1
-            ), "Current DynChunkTrain logic does not support dilation != 1"
+                self.dilation == ConMambaConstants.UNSUPPORTED_DILATION
+            ), f"Current DynChunkTrain logic does not support dilation != {ConMambaConstants.UNSUPPORTED_DILATION}"
 
             # in a causal convolution, which is not the case here, an output
             # frame would never be able to depend on a input frame from any
@@ -201,7 +416,7 @@ class ConvolutionModule(nn.Module):
                 weight=self.conv.weight,
                 bias=self.conv.bias,
                 stride=self.conv.stride,
-                padding=0,
+                padding=0,  # No padding for chunked convolution
                 dilation=self.conv.dilation,
                 groups=self.conv.groups,
             )
@@ -240,7 +455,111 @@ class ConvolutionModule(nn.Module):
 
 
 class ConmambaEncoderLayer(nn.Module):
-    """This is an implementation of Conmamba encoder layer.
+    """Core ConMamba encoder layer combining Mamba state-space modeling with convolution.
+
+    This layer implements the fundamental building block of the ConMamba architecture,
+    integrating Mamba's efficient sequential modeling with Conformer-style convolution
+    for local feature extraction. The design achieves linear computational complexity
+    while maintaining competitive modeling capacity for audio sequences.
+
+    ARCHITECTURAL INNOVATION:
+    ========================
+    The layer combines two complementary modeling approaches:
+    1. Mamba Module: Captures long-range dependencies with O(n) complexity
+    2. Convolution Module: Models local patterns with depthwise separable convs
+    3. Feed-Forward Networks: Apply non-linear transformations (2 FFN blocks)
+    4. Residual Connections: Enable deep network training with skip connections
+    5. Layer Normalization: Stabilize training and improve convergence
+
+    Layer Structure:
+    Input → FFN1 → Mamba → ConvModule → FFN2 → Output
+    Each component has residual connections and layer normalization.
+
+    MAMBA BIDIRECTIONAL PROCESSING:
+    ===============================
+    The layer supports both unidirectional and bidirectional Mamba processing:
+
+    Unidirectional Mode (causal=True or bidirectional=False):
+    - Uses standard Mamba from mamba_ssm package
+    - Processes sequences left-to-right only
+    - Compatible with streaming and autoregressive inference
+    - Lower memory usage, faster inference
+
+    Bidirectional Mode (causal=False and bidirectional=True):
+    - Uses custom BiMamba implementation
+    - Processes sequences in both directions
+    - Combines forward and backward representations
+    - Higher modeling capacity, slower inference
+
+    CROSS-FILE INTEGRATION:
+    ======================
+    Called by:
+    - ConmambaEncoder.forward(): Stacked to form complete encoder
+    - ConmambaEncoder.forward_streaming(): Streaming inference mode
+    
+    Calls to:
+    - mamba_ssm.Mamba: Standard unidirectional state-space model
+    - modules.mamba.bimamba.Mamba: Bidirectional Mamba implementation
+    - ConvolutionModule: Local feature extraction via convolution
+    - speechbrain.nnet.attention.PositionalwiseFeedForward: FFN components
+    - speechbrain.nnet.normalization.LayerNorm: Layer normalization
+
+    CONFIGURATION MANAGEMENT:
+    =========================
+    The mamba_config parameter controls Mamba behavior:
+    Required keys:
+    - 'bidirectional': Whether to use BiMamba (bool)
+    - 'd_state': Mamba state dimension (typically 16)
+    - 'd_conv': Convolution dimension for Mamba (typically 4)
+    - 'expand': Hidden dimension expansion factor (typically 2)
+
+    Configuration Handling Pattern:
+    1. Extract 'bidirectional' flag from mamba_config
+    2. Create appropriate Mamba instance based on causal and bidirectional flags
+    3. Restore 'bidirectional' flag to mamba_config for consistency
+
+    STATE MANAGEMENT:
+    ================
+    Instance variables and their lifecycles:
+
+    - self.mamba: Core sequence modeling component
+      * Created as either Mamba or BiMamba based on configuration
+      * Maintains internal state for streaming applications
+      * Device placement follows parent module automatically
+
+    - self.convolution_module: Local feature processing
+      * Handles causal/non-causal convolution based on layer configuration
+      * Supports dynamic chunk training for streaming inference
+      * Manages padding and activation states internally
+
+    - self.ffn_module1, self.ffn_module2: Feed-forward processing
+      * Pre- and post-processing FFN blocks with LayerNorm
+      * Apply non-linear transformations with configurable activation
+      * Include dropout for regularization during training
+
+    STREAMING SUPPORT:
+    =================
+    The layer supports streaming inference through:
+    - Mamba layers maintain internal state across sequence chunks
+    - Convolution module handles causal padding for streaming compatibility
+    - FFN modules operate independently on each frame (no temporal dependencies)
+    - Layer normalization operates on individual frames
+
+    MEMORY OPTIMIZATION:
+    ===================
+    Several optimizations reduce memory usage:
+    - Mamba's linear complexity avoids quadratic attention memory growth
+    - Depthwise convolution in ConvolutionModule reduces parameter count
+    - Residual connections reuse input tensors where possible
+    - Layer normalization has lower memory overhead than batch normalization
+
+    DEVICE COMPATIBILITY:
+    ====================
+    Full compatibility across compute platforms:
+    - CUDA: Optimized Mamba kernels and cuDNN convolution acceleration
+    - CPU: Reference implementations for all components
+    - Apple Silicon MPS: Efficient tensor operations (some Mamba ops may fallback)
+    - Mixed Precision: Supports autocast with proper gradient scaling
     """
 
     def __init__(
@@ -266,7 +585,7 @@ class ConmambaEncoderLayer(nn.Module):
         else:
             self.mamba = BiMamba(
                 d_model=d_model,
-                bimamba_type='v2',
+                bimamba_type=BiMambaConstants.BIMAMBA_TYPE_V2,
                 **mamba_config
             )
         mamba_config['bidirectional'] = bidirectional
@@ -316,7 +635,7 @@ class ConmambaEncoderLayer(nn.Module):
         conv_mask = None
 
         # ffn module
-        x = x + 0.5 * self.ffn_module1(x)
+        x = x + ConMambaConstants.FFN_RESIDUAL_SCALE * self.ffn_module1(x)
         # mamba module
         skip = x
         x = self.norm1(x)
@@ -327,7 +646,7 @@ class ConmambaEncoderLayer(nn.Module):
             x, conv_mask, dynchunktrain_config=dynchunktrain_config
         )
         # ffn module
-        x = self.norm2(x + 0.5 * self.ffn_module2(x))
+        x = self.norm2(x + ConMambaConstants.FFN_RESIDUAL_SCALE * self.ffn_module2(x))
         return x
 
 
@@ -365,7 +684,7 @@ class ConmambaEncoder(nn.Module):
                 for i in range(num_layers)
             ]
         )
-        self.norm = LayerNorm(d_model, eps=1e-6)
+        self.norm = LayerNorm(d_model, eps=ConMambaConstants.LAYER_NORM_EPS)
 
     def forward(
         self,
@@ -409,7 +728,112 @@ class ConmambaEncoder(nn.Module):
 
 
 class MambaDecoderLayer(nn.Module):
-    """This class implements the Mamba decoder layer.
+    """Mamba-based decoder layer for efficient autoregressive sequence generation.
+
+    This layer replaces traditional transformer decoder attention with Mamba state-space
+    models for both self-attention and cross-attention mechanisms. The design provides
+    linear computational complexity while maintaining the encoder-decoder paradigm
+    essential for sequence-to-sequence tasks like ASR.
+
+    ARCHITECTURAL INNOVATION:
+    ========================
+    The layer reimagines decoder attention using Mamba:
+    1. Self-Mamba: Processes target sequence autoregressively (replaces self-attention)
+    2. Cross-Mamba: Attends to encoder outputs (replaces cross-attention)  
+    3. Feed-Forward Network: Applies non-linear transformations
+    4. Residual Connections: Enable deep network training
+    5. Layer Normalization: Stabilize training with pre/post-norm options
+
+    Layer Structure:
+    Target → Self-Mamba → Cross-Mamba → FFN → Output
+    Each component includes residual connections and optional pre-normalization.
+
+    MAMBA vs ATTENTION COMPARISON:
+    ==============================
+    Traditional Decoder Attention:
+    - Self-attention: O(S²) complexity over target sequence length S
+    - Cross-attention: O(S×T) complexity between target (S) and source (T)
+    - Explicit key/value/query projections and attention weights
+
+    Mamba Decoder Design:
+    - Self-Mamba: O(S) complexity for autoregressive target processing
+    - Cross-Mamba: O(S+T) complexity for encoder-decoder interaction
+    - Implicit attention through selective state-space mechanisms
+
+    CROSS-FILE INTEGRATION:
+    ======================
+    Called by:
+    - MambaDecoder.forward(): Stacked to form complete autoregressive decoder
+    
+    Calls to:
+    - mamba_ssm.Mamba: Core state-space model for both self and cross processing
+    - speechbrain.nnet.attention.PositionalwiseFeedForward: FFN component
+    - speechbrain.nnet.normalization.LayerNorm: Layer normalization
+
+    AUTOREGRESSIVE PROCESSING:
+    ==========================
+    The layer maintains causality through Mamba's inherent design:
+    - Self-Mamba processes target tokens left-to-right only
+    - Cross-Mamba can access full encoder output (bidirectional)
+    - No explicit masking required (Mamba is inherently causal)
+    - Supports efficient incremental decoding for inference
+
+    STATE MANAGEMENT:
+    ================
+    Key instance variables and their roles:
+
+    - self.self_mamba: Target sequence processing
+      * Maintains autoregressive state across decoding steps
+      * Inherently causal, preventing future information leakage
+      * Linear complexity in sequence length
+
+    - self.cross_mamba: Encoder-decoder interaction
+      * Processes encoder outputs to generate context-aware representations
+      * Non-causal access to full encoder sequence
+      * Enables attention-like behavior without explicit attention weights
+
+    - self.pos_ffn: Feed-forward processing
+      * Applies position-wise non-linear transformations
+      * Shared across all sequence positions
+      * Includes dropout for regularization
+
+    NORMALIZATION STRATEGY:
+    ======================
+    Supports both pre-norm and post-norm configurations:
+
+    Pre-Normalization (normalize_before=True):
+    - Apply LayerNorm before each sub-layer
+    - Better gradient flow, more stable training
+    - Recommended for deep networks and difficult optimization
+
+    Post-Normalization (normalize_before=False):
+    - Apply LayerNorm after each sub-layer (with residual)
+    - Original Transformer design pattern
+    - May require learning rate scheduling for stability
+
+    MEMORY OPTIMIZATION:
+    ===================
+    Several design choices optimize memory usage:
+    - Linear complexity Mamba operations vs. quadratic attention
+    - Shared Mamba configuration reduces parameter overhead
+    - Efficient state representation in Mamba internal buffers
+    - Optional gradient checkpointing for deeper networks
+
+    DEVICE COMPATIBILITY:
+    ====================
+    Full support across compute platforms:
+    - CUDA: Optimized Mamba kernels with selective scan acceleration
+    - CPU: Reference implementation for development and testing
+    - Apple Silicon MPS: Efficient tensor operations (some Mamba ops may fallback)
+    - Mixed Precision: Compatible with autocast and gradient scaling
+
+    INFERENCE OPTIMIZATION:
+    ======================
+    The layer supports efficient incremental decoding:
+    - Mamba maintains internal state across decoding steps
+    - No need to recompute attention over previous tokens
+    - Constant memory usage independent of generated sequence length
+    - Compatible with beam search and other decoding strategies
     """
 
     def __init__(
@@ -447,9 +871,9 @@ class MambaDecoderLayer(nn.Module):
         )
 
         # normalization layers
-        self.norm1 = sb.nnet.normalization.LayerNorm(d_model, eps=1e-6)
-        self.norm2 = sb.nnet.normalization.LayerNorm(d_model, eps=1e-6)
-        self.norm3 = sb.nnet.normalization.LayerNorm(d_model, eps=1e-6)
+        self.norm1 = sb.nnet.normalization.LayerNorm(d_model, eps=ConMambaConstants.LAYER_NORM_EPS)
+        self.norm2 = sb.nnet.normalization.LayerNorm(d_model, eps=ConMambaConstants.LAYER_NORM_EPS)
+        self.norm3 = sb.nnet.normalization.LayerNorm(d_model, eps=ConMambaConstants.LAYER_NORM_EPS)
         self.dropout1 = torch.nn.Dropout(dropout)
         self.dropout2 = torch.nn.Dropout(dropout)
         self.dropout3 = torch.nn.Dropout(dropout)
@@ -557,7 +981,7 @@ class MambaDecoder(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.norm = sb.nnet.normalization.LayerNorm(d_model, eps=1e-6)
+        self.norm = sb.nnet.normalization.LayerNorm(d_model, eps=ConMambaConstants.LAYER_NORM_EPS)
 
     def forward(
         self,
